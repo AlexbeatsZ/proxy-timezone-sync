@@ -14,6 +14,7 @@ export function controllerCandidates(config = {}) {
     }
     const uid = process.getuid?.();
     const candidates = [
+        `/var/run/clash-verge-service/users/${uid}/verge-mihomo.sock`,
         `/var/run/clash-verge-rev/users/${uid}/verge-mihomo.sock`,
         '/tmp/verge/verge-mihomo.sock'
     ];

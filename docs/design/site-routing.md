@@ -19,7 +19,7 @@ The bridge caches geolocation per hostname and concrete route, for at most 15 mi
 
 ## Bridge boundary
 
-- Windows uses discovered production named pipes; Mac discovers the running Unix socket including `external-controller-unix` in the current Clash Verge configuration. Only GET `/version`, `/configs`, `/connections`, `/proxies`, `/providers/proxies` is permitted by the client.
+- Windows uses discovered production named pipes; Mac prefers the service-mode socket `/var/run/clash-verge-service/users/<uid>/verge-mihomo.sock`, with legacy/app-config paths as fallbacks. App-data configuration can reference an absent sidecar socket while the service core is healthy. Only GET `/version`, `/configs`, `/connections`, `/proxies`, `/providers/proxies` is permitted by the client.
 - HTTP bridge binds only `127.0.0.1:17898`. Authentication token and machine identity live in ignored `.runtime/` files, never in the published userscript or Git history.
 - Only fixed endpoints and AI hostnames from the userscript allowlist are accepted. No arbitrary URL/proxy/controller operations. Loopback Host/peer checks and token authentication are required; no permissive CORS.
 - Existing proxy listener ports are explicit local configuration. A listener's name/config is not sufficient proof: actual tunnel-chain observation is mandatory.
