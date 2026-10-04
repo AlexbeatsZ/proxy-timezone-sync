@@ -39,27 +39,27 @@ export async function openProbe(port) {
             return new Promise((resolve, reject) => {
                 tlsSocket.once('error', reject);
                 tlsSocket.once('close', () => reject(new Error('IP probe closed')));
-                    agent = new https.Agent({ keepAlive: false });
-                    agent.createConnection = () => tlsSocket;
-                    const request = https.get({ hostname: 'ipwho.is', path: '/?fields=success,ip,timezone.id', agent, timeout: 8000, headers: { 'User-Agent': 'ProxyTimezoneSync/3.0', 'Accept': 'application/json' } }, response => {
-                        let body = '';
-                        response.on('data', chunk => {
-                            body += chunk;
-                            if (body.length > 16384) request.destroy(new Error('IP response too large'));
-                        });
-                        response.on('error', reject);
-                        response.on('end', () => {
-                            try {
-                                if (response.statusCode !== 200) throw new Error('IP lookup failed');
-                                const data = JSON.parse(body);
-                                if (data.success === false || !net.isIP(data.ip) || !data.timezone?.id) throw new Error('Invalid IP lookup response');
-                                new Intl.DateTimeFormat('en', { timeZone: data.timezone.id });
-                                resolve({ ip: data.ip, timeZone: data.timezone.id });
-                            } catch (error) { reject(error); }
-                        });
+                agent = new https.Agent({ keepAlive: false });
+                agent.createConnection = () => tlsSocket;
+                const request = https.get({ hostname: 'ipwho.is', path: '/?fields=success,ip,timezone.id', agent, timeout: 8000, headers: { 'User-Agent': 'ProxyTimezoneSync/3.0', 'Accept': 'application/json' } }, response => {
+                    let body = '';
+                    response.on('data', chunk => {
+                        body += chunk;
+                        if (body.length > 16384) request.destroy(new Error('IP response too large'));
                     });
-                    request.on('timeout', () => request.destroy(new Error('IP lookup timeout')));
-                    request.on('error', reject);
+                    response.on('error', reject);
+                    response.on('end', () => {
+                        try {
+                            if (response.statusCode !== 200) throw new Error('IP lookup failed');
+                            const data = JSON.parse(body);
+                            if (data.success === false || !net.isIP(data.ip) || !data.timezone?.id) throw new Error('Invalid IP lookup response');
+                            new Intl.DateTimeFormat('en', { timeZone: data.timezone.id });
+                            resolve({ ip: data.ip, timeZone: data.timezone.id });
+                        } catch (error) { reject(error); }
+                    });
+                });
+                request.on('timeout', () => request.destroy(new Error('IP lookup timeout')));
+                request.on('error', reject);
             });
         }
     };
