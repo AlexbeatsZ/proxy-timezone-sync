@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         自动同步代理时区 (Proxy Timezone Sync) v2.1 (静默版)
 // @namespace    https://antigravity.assistant/
-// @version      2.1.2
-// @description  仅在指定 AI 服务及相关站点同步代理出口时区，其他网页保持系统时区（全静默无阻断）
+// @version      3.0.0
+// @description  按当前 AI 网站实际出口或已核实代理链同步时区，支持 Windows / Mac，其他网页保持系统时区
 // @author       Antigravity
 // @homepageURL  https://github.com/AlexbeatsZ/proxy-timezone-sync
 // @supportURL   https://github.com/AlexbeatsZ/proxy-timezone-sync/issues
@@ -41,7 +41,8 @@
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @connect      ipwho.is
-// @connect      api.ip.sb
+// @connect      self
+// @connect      127.0.0.1
 // ==/UserScript==
 
 (function () {
@@ -67,73 +68,177 @@
     if (!isAiPage) return;
 
 
-    const CACHE_KEY = 'PROXY_TZ_CACHE_V2';
-    const OVERRIDE_KEY = 'MANUAL_TZ_OVERRIDE';
-    const CACHE_EXPIRE_MS = 15 * 60 * 1000; // 缓存 15 分钟
-
-    const cachedData = GM_getValue(CACHE_KEY, null);
-    const manualTz = GM_getValue(OVERRIDE_KEY, '');
-
-    // 当前生效时区状态（支持动态热更新）
-    let activeTimeZone = manualTz || (cachedData && cachedData.timeZone) || 'America/Los_Angeles';
-
-    // 格式化器列表，用于时区变动时动态同步
+    const pageContext = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    const pageFetch = pageContext.fetch.bind(pageContext);
+    const NativeFormat = pageContext.Intl.DateTimeFormat;
+    const nativeTimeZone = NativeFormat().resolvedOptions().timeZone;
+    const SITE_CACHE_KEY = 'PROXY_TZ_CACHE_V3:' + pageHost;
+    const SITE_OVERRIDE_KEY = 'MANUAL_TZ_OVERRIDE_V3:' + pageHost;
+    const BRIDGE_KEY = 'PROXY_TZ_BRIDGE_V3';
+    const BRIDGE_URL = 'http://127.0.0.1:17898';
     const activeUpdaters = [];
+    let activeTimeZone = validZone(GM_getValue(SITE_OVERRIDE_KEY, '')) || nativeTimeZone;
+    let generation = 0;
+    let lastResult = { evidence: activeTimeZone === nativeTimeZone ? 'native' : 'manual' };
 
-    // 1. 穿透注入全局上下文
+    // Old global V2 cache and override stay stored, but are never applied automatically.
     applyTimezoneHook();
+    detectTimezone(false);
 
-    // 2. 检查是否需要更新代理 IP 时区（后台静默检测）
-    const now = Date.now();
-    if (!manualTz && (!cachedData || (now - cachedData.timestamp > CACHE_EXPIRE_MS))) {
-        detectProxyTimezone(false);
-    }
-
-    // 3. 快捷菜单
-    GM_registerMenuCommand(`🔄 立即检测代理时区 (当前生效: ${activeTimeZone})`, () => {
-        detectProxyTimezone(true);
-    });
-
-    GM_registerMenuCommand(`⚙️ 手动指定时区 (留空恢复自动)`, () => {
-        const current = GM_getValue(OVERRIDE_KEY, '');
-        const input = prompt('输入目标时区名（例如 America/New_York、Asia/Tokyo、Europe/London），留空恢复自动检测：', current);
-        if (input !== null) {
-            const trimmed = input.trim();
-            GM_setValue(OVERRIDE_KEY, trimmed);
-            if (trimmed) {
-                switchActiveTimeZone(trimmed);
-            } else {
-                const refreshed = GM_getValue(CACHE_KEY, null);
-                switchActiveTimeZone((refreshed && refreshed.timeZone) || 'America/Los_Angeles');
-            }
+    GM_registerMenuCommand('🔄 重新识别此网站的代理时区', () => detectTimezone(true));
+    GM_registerMenuCommand('⚙️ 手动指定此网站时区', () => {
+        const input = prompt('仅设置 ' + pageHost + ' 的时区，例如 Asia/Tokyo 或 America/Los_Angeles。留空恢复自动识别：', GM_getValue(SITE_OVERRIDE_KEY, ''));
+        if (input === null) return;
+        const timeZone = input.trim();
+        if (timeZone && !validZone(timeZone)) return alert('时区名称无效。');
+        GM_setValue(SITE_OVERRIDE_KEY, timeZone);
+        generation++;
+        if (timeZone) {
+            lastResult = { evidence: 'manual' };
+            switchActiveTimeZone(timeZone);
+        } else {
+            switchActiveTimeZone(nativeTimeZone);
+            detectTimezone(true);
         }
     });
-
-    GM_registerMenuCommand(`🧪 打印当前时区诊断信息`, () => {
-        const currentIntl = Intl.DateTimeFormat().resolvedOptions().timeZone;
-        const currentOffset = new Date().getTimezoneOffset();
-        const dateStr = new Date().toString();
-        alert(`【时区诊断】\n当前生效时区: ${currentIntl}\nOffset 偏移量: ${currentOffset} 分钟\n时间字符串: ${dateStr}`);
+    GM_registerMenuCommand('🔗 连接本机代理助手（Windows / Mac）', () => {
+        const input = prompt('粘贴本机代理助手生成的 client-settings.json 内容。留空断开助手：', '');
+        if (input === null) return;
+        if (!input.trim()) {
+            GM_setValue(BRIDGE_KEY, null);
+        } else {
+            try {
+                const config = JSON.parse(input);
+                if (config.url !== BRIDGE_URL || !/^[a-f0-9]{64}$/.test(config.token)) throw new Error();
+                GM_setValue(BRIDGE_KEY, { url: config.url, token: config.token });
+            } catch { return alert('助手配置无效，请复制 client-settings.json 的完整内容。'); }
+        }
+        detectTimezone(true);
     });
+    GM_registerMenuCommand('🧪 查看此网站时区', () => {
+        const labels = { native: '未核实，保留系统时区', manual: '此网站手动设置', 'site-ip': '网站自身返回的出口 IP', 'verified-proxy-chain': '本机已核对代理链' };
+        alert('网站：' + pageHost + '\n生效时区：' + activeTimeZone + '\n来源：' + (labels[lastResult.evidence] || labels.native) +
+            (lastResult.ip ? '\n出口 IP：' + lastResult.ip : '') +
+            (lastResult.route ? '\n代理：' + lastResult.route.join(' → ') : ''));
+    });
+    const legacyManual = validZone(GM_getValue('MANUAL_TZ_OVERRIDE', ''));
+    if (legacyManual) GM_registerMenuCommand('沿用旧手动时区到此网站', () => {
+        generation++;
+        GM_setValue(SITE_OVERRIDE_KEY, legacyManual);
+        lastResult = { evidence: 'manual' };
+        switchActiveTimeZone(legacyManual);
+    });
+    setInterval(() => { if (!document.hidden) detectTimezone(false); }, 60000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) detectTimezone(false); });
 
-    // ========================================================
-    // 动态时区切换（热更新，无需刷新页面）
-    // ========================================================
-    function switchActiveTimeZone(newTz) {
-        if (!newTz || newTz === activeTimeZone) return;
-        activeTimeZone = newTz;
-        activeUpdaters.forEach(fn => {
-            try { fn(newTz); } catch (e) {}
-        });
-        console.log(
-            `%c[TimezoneSync] 🔄 时区已静默热更新为: ${newTz}`,
-            'color: #0284c7; font-weight: bold; background: #f0f9ff; padding: 2px 6px; border-radius: 4px;'
-        );
+    function validZone(value) {
+        if (typeof value !== 'string' || !value || value.length > 100) return '';
+        try { new NativeFormat('en', { timeZone: value }); return value; } catch { return ''; }
     }
 
-    // ========================================================
-    // 核心 Hook
-    // ========================================================
+    function switchActiveTimeZone(timeZone) {
+        if (!validZone(timeZone) || timeZone === activeTimeZone) return;
+        activeTimeZone = timeZone;
+        for (const update of activeUpdaters) update(timeZone);
+    }
+
+    function request(details, timeout = 12000) {
+        return new Promise((resolve, reject) => {
+            let handle;
+            let done = false;
+            const finish = (error, response) => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                error ? reject(error) : resolve(response);
+            };
+            const timer = setTimeout(() => {
+                finish(new Error('Request timeout'));
+                handle?.abort();
+            }, timeout);
+            try {
+                handle = GM_xmlhttpRequest({ ...details, timeout, onload: response => finish(null, response),
+                    onerror: () => finish(new Error('Request failed')), ontimeout: () => finish(new Error('Request timeout')) });
+            } catch (error) { finish(error); }
+        });
+    }
+
+    function normalizedIp(value) {
+        if (typeof value !== 'string' || value.length > 45) return '';
+        if (/^(\d{1,3}\.){3}\d{1,3}$/.test(value) && value.split('.').every(part => Number(part) <= 255)) return value.split('.').map(Number).join('.');
+        if (value.includes(':') && /^[0-9a-f:.]+$/i.test(value)) {
+            try { return new URL('https://[' + value + ']/').hostname.toLowerCase(); } catch { /* Invalid IPv6. */ }
+        }
+        return '';
+    }
+
+    async function requestOrigin(method, pathname, timeout = 12000) {
+        // Keep this request in the page's network context, including per-tab proxy rules.
+        const controller = new pageContext.AbortController();
+        const timer = setTimeout(() => controller.abort(), timeout);
+        try {
+            const response = await pageFetch(location.origin + pathname, { method, credentials: 'omit',
+                cache: 'no-store', redirect: 'error', signal: controller.signal });
+            if (new URL(response.url).origin !== location.origin) throw new Error('Origin changed');
+            return { status: response.status, responseText: method === 'HEAD' ? '' : await response.text(), finalUrl: response.url };
+        } finally { clearTimeout(timer); }
+    }
+
+    async function lookupSiteIp() {
+        const trace = await requestOrigin('GET', '/cdn-cgi/trace');
+        if (trace.status !== 200 || typeof trace.responseText !== 'string' || trace.responseText.length > 8192 ||
+            new URL(trace.finalUrl || location.origin).origin !== location.origin) throw new Error('No same-origin trace');
+        const fields = Object.fromEntries(trace.responseText.split(/\r?\n/).filter(line => line.includes('=')).map(line => {
+            const index = line.indexOf('='); return [line.slice(0, index), line.slice(index + 1)];
+        }));
+        if ((fields.h || '').toLowerCase() !== location.hostname.toLowerCase() || !normalizedIp(fields.ip) || !fields.ts || !fields.loc) throw new Error('Invalid site trace');
+        const response = await request({ method: 'GET', url: 'https://ipwho.is/' + encodeURIComponent(fields.ip) + '?fields=success,ip,timezone.id', anonymous: true });
+        if (response.status !== 200 || new URL(response.finalUrl || 'https://ipwho.is/').hostname !== 'ipwho.is') throw new Error('IP lookup failed');
+        const data = JSON.parse(response.responseText);
+        if (data.success === false || normalizedIp(data.ip) !== normalizedIp(fields.ip) || !validZone(data.timezone?.id)) throw new Error('IP lookup mismatch');
+        return { host: pageHost, ip: fields.ip, timeZone: data.timezone.id, evidence: 'site-ip', verifiedAt: Date.now() };
+    }
+
+    async function lookupBridge(fresh) {
+        const config = GM_getValue(BRIDGE_KEY, null);
+        if (!config || config.url !== BRIDGE_URL || !/^[a-f0-9]{64}$/.test(config.token)) throw new Error('Bridge is not configured');
+        // A same-origin request helps expose the current browser route to Mihomo.
+        try { await requestOrigin('HEAD', '/', 6000); } catch { /* Existing page connections may still provide evidence. */ }
+        const response = await request({ method: 'GET', url: BRIDGE_URL + '/v1/timezone?host=' + encodeURIComponent(pageHost) + (fresh ? '&fresh=1' : ''),
+            headers: { Authorization: 'Bearer ' + config.token }, anonymous: true }, 24000);
+        if (response.status !== 200 || new URL(response.finalUrl || BRIDGE_URL).origin !== BRIDGE_URL) throw new Error('Website route was not verified');
+        const result = JSON.parse(response.responseText);
+        if (result.host !== pageHost || result.evidence !== 'verified-proxy-chain' || !validZone(result.timeZone) ||
+            !normalizedIp(result.ip) || !Array.isArray(result.route) || !result.route.length ||
+            typeof result.routeId !== 'string' || !Number.isFinite(result.verifiedAt) || Math.abs(Date.now() - result.verifiedAt) > 120000) throw new Error('Invalid bridge response');
+        return result;
+    }
+
+    async function detectTimezone(manual) {
+        const owner = ++generation;
+        const override = validZone(GM_getValue(SITE_OVERRIDE_KEY, ''));
+        if (override) {
+            lastResult = { evidence: 'manual' };
+            switchActiveTimeZone(override);
+            return;
+        }
+        try {
+            let result;
+            try { result = await lookupSiteIp(); } catch { result = await lookupBridge(manual); }
+            if (owner !== generation || validZone(GM_getValue(SITE_OVERRIDE_KEY, ''))) return;
+            GM_setValue(SITE_CACHE_KEY, result);
+            lastResult = result;
+            switchActiveTimeZone(result.timeZone);
+            if (manual) alert('此网站已识别为 ' + result.timeZone + (result.ip ? '\n出口 IP：' + result.ip : ''));
+        } catch {
+            if (owner !== generation || validZone(GM_getValue(SITE_OVERRIDE_KEY, ''))) return;
+            lastResult = { evidence: 'native' };
+            switchActiveTimeZone(nativeTimeZone);
+            if (manual) alert('暂时无法核实此网站的出口，已保留系统时区。可连接本机代理助手或为此网站手动指定时区。');
+        }
+    }
+
+
     function applyTimezoneHook() {
         const targets = [];
         if (typeof unsafeWindow !== 'undefined' && unsafeWindow) targets.push(unsafeWindow);
@@ -166,13 +271,34 @@
         // 1. Hook Intl.DateTimeFormat（动态跟随 activeTimeZone）
         const PatchedDateTimeFormat = function (locales, options) {
             const opts = Object.assign({}, options);
-            if (!opts.timeZone) {
+            const followsPage = opts.timeZone === undefined;
+            if (followsPage) {
                 opts.timeZone = activeTimeZone;
             }
-            if (!(this instanceof PatchedDateTimeFormat)) {
-                return new OrigDateTimeFormat(locales, opts);
+            const target = new.target || OrigDateTimeFormat;
+            let formatter = Reflect.construct(OrigDateTimeFormat, [locales, opts], target);
+            if (!followsPage) return formatter;
+            let currentZone = activeTimeZone;
+            const methods = new Map();
+            function refresh() {
+                if (currentZone !== activeTimeZone) {
+                    formatter = Reflect.construct(OrigDateTimeFormat, [locales, { ...opts, timeZone: activeTimeZone }], target);
+                    currentZone = activeTimeZone;
+                }
             }
-            return Reflect.construct(OrigDateTimeFormat, [locales, opts], new.target || PatchedDateTimeFormat);
+            // Page code often caches formatters before asynchronous route detection completes.
+            return new Proxy(formatter, {
+                get(_base, property) {
+                    refresh();
+                    const value = Reflect.get(formatter, property, formatter);
+                    if (typeof value !== 'function' || property === 'constructor') return value;
+                    if (!methods.has(property)) methods.set(property, disguiseNative(function (...args) {
+                        refresh();
+                        return Reflect.apply(Reflect.get(formatter, property, formatter), formatter, args);
+                    }, typeof property === 'string' ? property : value.name));
+                    return methods.get(property);
+                }
+            });
         };
         PatchedDateTimeFormat.prototype = OrigDateTimeFormat.prototype;
         PatchedDateTimeFormat.supportedLocalesOf = OrigDateTimeFormat.supportedLocalesOf;
@@ -239,67 +365,6 @@
         OrigDate.prototype.getMinutes = disguiseNative(function getMinutes() { return asShifted(this).getUTCMinutes(); }, 'getMinutes');
         OrigDate.prototype.getSeconds = disguiseNative(function getSeconds() { return asShifted(this).getUTCSeconds(); }, 'getSeconds');
 
-        // 控制台初始状态输出
-        const offsetVal = getTargetOffset(new OrigDate());
-        console.log(
-            `%c[TimezoneSync] ✅ 代理时区已穿透注入: ${activeTimeZone} (Offset: ${offsetVal})`,
-            'color: #10b981; font-weight: bold; background: #ecfdf5; padding: 3px 8px; border-radius: 4px; border: 1px solid #a7f3d0;'
-        );
     }
 
-    // ========================================================
-    // 代理 IP 探测
-    // ========================================================
-    function detectProxyTimezone(isManual) {
-        GM_xmlhttpRequest({
-            method: 'GET',
-            url: 'https://ipwho.is/',
-            timeout: 6000,
-            onload: function (res) {
-                try {
-                    const data = JSON.parse(res.responseText);
-                    if (data && data.success !== false && data.timezone && data.timezone.id) {
-                        saveResult(data.ip, data.timezone.id, isManual);
-                        return;
-                    }
-                } catch (e) {}
-                fallbackFetch(isManual);
-            },
-            onerror: () => fallbackFetch(isManual),
-            ontimeout: () => fallbackFetch(isManual)
-        });
-    }
-
-    function fallbackFetch(isManual) {
-        GM_xmlhttpRequest({
-            method: 'GET',
-            url: 'https://api.ip.sb/geoip',
-            timeout: 6000,
-            onload: function (res) {
-                try {
-                    const data = JSON.parse(res.responseText);
-                    if (data && data.timezone) {
-                        saveResult(data.ip, data.timezone, isManual);
-                        return;
-                    }
-                } catch (e) {}
-                if (isManual) alert('探测代理时区失败，请检查网络。');
-            },
-            onerror: () => { if (isManual) alert('连接网络错误。'); }
-        });
-    }
-
-    function saveResult(ip, timeZone, isManual) {
-        GM_setValue(CACHE_KEY, { ip, timeZone, timestamp: Date.now() });
-
-        // 如果未锁定手动时区，则无缝切换到新时区
-        if (!GM_getValue(OVERRIDE_KEY, '')) {
-            switchActiveTimeZone(timeZone);
-        }
-
-        // 仅在用户手动点击菜单探测时才弹窗反馈，自动检测时 100% 静默无感
-        if (isManual) {
-            alert(`✅ 探测成功！\n出口 IP: ${ip}\n对应时区: ${timeZone}`);
-        }
-    }
 })();
